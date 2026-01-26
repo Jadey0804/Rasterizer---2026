@@ -1,0 +1,33 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+build/
+out/
+
+# Intermediate files
+*.obj
+*.pch
+*.idb
+*.pdb
+*.ilk
+*.tlog
+*.log
+
+# CMake / cache
+CMakeFiles/
+CMakeCache.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optional: ignore copied runtime assets if you regenerate them
+# Levels_copy/
+# Models_copy/
