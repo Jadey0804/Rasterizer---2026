@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "mesh.h"
 #include "colour.h"
@@ -7,6 +7,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+
+#include "BuildConfig.h"
 
 // Simple support class for a 2D vector
 class vec2D {
@@ -43,6 +45,17 @@ class triangle {
     float area;        // Area of the triangle
     colour col[3];     // Colors for each vertex of the triangle
 
+
+    static inline float edgeFn(float ax, float ay, float bx, float by, float x, float y) {
+		return(ay - by) * x + (bx - ax) * y + (ax * by -  bx*ay);
+    }
+
+    static inline bool isInside(float e01, float e12, float e20, float area2) {
+        if (area2 > 0.0f)return(e01 >= 0.0f && e12 >= 0.0f && e20 >= 0.0f);
+        else return(e01 <= 0.0f && e12 <= 0.0f && e20 <= 0.0f);
+    }
+
+
 public:
     // Constructor initializes the triangle with three vertices
     // Input Variables:
@@ -75,10 +88,11 @@ public:
     // - alpha, beta, gamma: Barycentric coordinates of the point
     // Returns true if the point is inside the triangle, false otherwise
     bool getCoordinates(vec2D p, float& alpha, float& beta, float& gamma) {
-        alpha = getC(vec2D(v[0].p), vec2D(v[1].p), p) / area;
-        beta = getC(vec2D(v[1].p), vec2D(v[2].p), p) / area;
-        gamma = getC(vec2D(v[2].p), vec2D(v[0].p), p) / area;
-
+       
+            alpha = getC(vec2D(v[0].p), vec2D(v[1].p), p) / area;
+            beta = getC(vec2D(v[1].p), vec2D(v[2].p), p) / area;
+            gamma = getC(vec2D(v[2].p), vec2D(v[0].p), p) / area;
+        
         if (alpha < 0.f || beta < 0.f || gamma < 0.f) return false;
         return true;
     }
@@ -99,7 +113,19 @@ public:
     // - L: Light object for shading calculations
     // - ka, kd: Ambient and diffuse lighting coefficients
     void draw(Renderer& renderer, Light& L, float ka, float kd) {
+        if (useEdgeRaster) {
+            draw_edgeRaster(renderer, L, ka, kd);
+            return;
+        }
+
         vec2D minV, maxV;
+		//避免多线程多个triangle共享一个Light,不在像素里改L.omega_i,统一用局部lightDir;
+        vec4 lightDir = L.omega_i;
+
+        if (useLightOPT) {
+			lightDir.normalise();
+        }
+
 
         // Get the screen-space bounds of the triangle
         getBoundsWindow(renderer.canvas, minV, maxV);
@@ -118,14 +144,21 @@ public:
                     colour c = interpolate(beta, gamma, alpha, v[0].rgb, v[1].rgb, v[2].rgb);
                     c.clampColour();
                     float depth = interpolate(beta, gamma, alpha, v[0].p[2], v[1].p[2], v[2].p[2]);
+
                     vec4 normal = interpolate(beta, gamma, alpha, v[0].normal, v[1].normal, v[2].normal);
-                    normal.normalise();
+					normal.normalise();
+ 
+    
 
                     // Perform Z-buffer test and apply shading
                     if (renderer.zbuffer(x, y) > depth && depth > 0.001f) {
                         // typical shader begin
-                        L.omega_i.normalise();
-                        float dot = std::max(vec4::dot(L.omega_i, normal), 0.0f);
+                        if (!useLightOPT) {
+                            lightDir = L.omega_i;
+							lightDir.normalise();
+
+                        }
+                        float dot = std::max(vec4::dot(lightDir, normal), 0.0f);
                         colour a = (c * kd) * (L.L * dot) + (L.ambient * ka); // using kd instead of ka for ambient
                         // typical shader end
                         unsigned char r, g, b;
@@ -137,6 +170,127 @@ public:
             }
         }
     }
+
+    void draw_edgeRaster(Renderer& renderer, Light& L, float ka, float kd) {
+        vec2D minV, maxV;
+		vec4 lightDir;
+
+        if (useLightOPT) {
+			lightDir = L.omega_i;
+			lightDir.normalise();
+        }
+
+
+
+        getBoundsWindow(renderer.canvas, minV, maxV);
+
+        // Skip very small triangles (用 area2 版本也可以，但沿用你的逻辑)
+        if (area < 1.f) return;
+
+        const float x0 = v[0].p[0], y0 = v[0].p[1];
+        const float x1 = v[1].p[0], y1 = v[1].p[1];
+        const float x2 = v[2].p[0], y2 = v[2].p[1];
+
+        // 用像素中心采样，避免边界漏点（如果你想和 baseline 完全一致，可以去掉 +0.5）
+        int minX = (int)minV.x;
+        int minY = (int)minV.y;
+        int maxX = (int)ceil(maxV.x);
+        int maxY = (int)ceil(maxV.y);
+
+        // 防止越界（getBoundsWindow 已裁剪过，但这里再保险一次）
+        minX = std::max(minX, 0);
+        minY = std::max(minY, 0);
+        maxX = std::min(maxX, (int)renderer.canvas.getWidth());
+        maxY = std::min(maxY, (int)renderer.canvas.getHeight());
+
+        // 计算有向面积 area2（注意：不是 fabs）
+        const float area2 = edgeFn(x0, y0, x1, y1, x2, y2);
+        if (area2 == 0.0f) return;
+        const float invArea2 = 1.0f / area2; // 只做一次除法
+
+        // 三条边的增量（x+1 加 dx；y+1 加 dy）
+        const float e01_dx = (y0 - y1);
+        const float e01_dy = (x1 - x0);
+
+        const float e12_dx = (y1 - y2);
+        const float e12_dy = (x2 - x1);
+
+        const float e20_dx = (y2 - y0);
+        const float e20_dy = (x0 - x2);
+
+        // 光方向 normalize
+       
+        if (!useLightOPT) {
+            lightDir.normalise();
+        }
+        else {
+            lightDir.normalise();
+        }
+
+        // 起始采样点
+        const float startX = (float)minX;
+        const float startY = (float)minY;
+
+        // 行起点的边函数值（只算一次）
+        float e01_row = edgeFn(x0, y0, x1, y1, startX, startY);
+        float e12_row = edgeFn(x1, y1, x2, y2, startX, startY);
+        float e20_row = edgeFn(x2, y2, x0, y0, startX, startY);
+
+        for (int y = minY; y < maxY; ++y) {
+            float e01 = e01_row;
+            float e12 = e12_row;
+            float e20 = e20_row;
+
+            for (int x = minX; x < maxX; ++x) {
+                if (isInside(e01, e12, e20, area2)) {
+                    // barycentric：w0 对 v0, w1 对 v1, w2 对 v2
+                    // 常用对应：w0 = E12/area2, w1 = E20/area2, w2 = E01/area2
+                    const float w0 = e12 * invArea2;
+                    const float w1 = e20 * invArea2;
+                    const float w2 = e01 * invArea2;
+
+                    const float beta = w0;
+                    const float gamma = w1;
+                    const float alpha = w2;
+
+                    colour c = interpolate(beta, gamma, alpha, v[0].rgb, v[1].rgb, v[2].rgb);
+                    c.clampColour();
+
+                    float depth = interpolate(beta, gamma, alpha, v[0].p[2], v[1].p[2], v[2].p[2]);
+
+                    vec4 normal = interpolate(beta, gamma, alpha, v[0].normal, v[1].normal, v[2].normal);
+					normal.normalise();
+
+                    if (renderer.zbuffer(x, y) > depth && depth > 0.001f) {
+                       
+                        if (!useLightOPT) {
+                            lightDir = L.omega_i;
+                            lightDir.normalise();
+						}
+                        
+                        float dot = std::max(vec4::dot(lightDir, normal), 0.0f);
+                        colour a = (c * kd) * (L.L * dot) + (L.ambient * ka);
+
+                        unsigned char r, g, b;
+                        a.toRGB(r, g, b);
+                        renderer.canvas.draw(x, y, r, g, b);
+                        renderer.zbuffer(x, y) = depth;
+                    }
+                }
+
+                // x+1：边函数增量更新（只加法）
+                e01 += e01_dx;
+                e12 += e12_dx;
+                e20 += e20_dx;
+            }
+
+            // y+1：行起点增量更新
+            e01_row += e01_dy;
+            e12_row += e12_dy;
+            e20_row += e20_dy;
+        }
+    }
+
 
     // Compute the 2D bounds of the triangle
     // Output Variables:
