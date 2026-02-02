@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 #define _USE_MATH_DEFINES
 #include <cmath>
 
@@ -60,16 +60,48 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
     }
 
     // --- Triangle loop: only gather 3 cached vertices and draw ---
-    for (triIndices& ind : mesh->triangles) {
-        const Vertex& v0 = tv[ind.v[0]];
-        const Vertex& v1 = tv[ind.v[1]];
-        const Vertex& v2 = tv[ind.v[2]];
+	//-----------use Backface Culling----------------
+    if (useBackfaceCulling) {
+        for (triIndices& ind : mesh->triangles) {
+            const Vertex& v0 = tv[ind.v[0]];
+            const Vertex& v1 = tv[ind.v[1]];
+            const Vertex& v2 = tv[ind.v[2]];
 
-        // Clip triangles with Z-values outside [-1, 1]
-        if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+            // 原本的 z check
+            if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
 
-        triangle tri(v0, v1, v2);
-        tri.draw(renderer, L, mesh->ka, mesh->kd);
+            // -------- Back-face culling (screen-space) --------
+            if (useBackfaceCulling) {
+                float x0 = v0.p[0], y0 = v0.p[1];
+                float x1 = v1.p[0], y1 = v1.p[1];
+                float x2 = v2.p[0], y2 = v2.p[1];
+
+                float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+
+                // 注意：如果你发现正面全没了，就把 <= 0 改成 >= 0
+                if (area2 <= 0.0f) continue;
+            }
+            // -----------------------------------------------
+
+            triangle tri(v0, v1, v2);
+            tri.draw(renderer, L, mesh->ka, mesh->kd);
+        }
+
+    }
+
+    else {
+
+        for (triIndices& ind : mesh->triangles) {
+            const Vertex& v0 = tv[ind.v[0]];
+            const Vertex& v1 = tv[ind.v[1]];
+            const Vertex& v2 = tv[ind.v[2]];
+
+            // Clip triangles with Z-values outside [-1, 1]
+            if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+
+            triangle tri(v0, v1, v2);
+            tri.draw(renderer, L, mesh->ka, mesh->kd);
+        }
     }
 }
 
@@ -110,6 +142,23 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
         // Clip triangles with Z-values outside [-1, 1]
         if (fabs(t[0].p[2]) > 1.0f || fabs(t[1].p[2]) > 1.0f || fabs(t[2].p[2]) > 1.0f) continue;
+
+        if(useBackfaceCulling) {
+            // -------- Back-face culling (screen-space signed area) --------
+            if (useBackfaceCulling) {
+                const float x0 = t[0].p[0], y0 = t[0].p[1];
+                const float x1 = t[1].p[0], y1 = t[1].p[1];
+                const float x2 = t[2].p[0], y2 = t[2].p[1];
+
+                // area2 = cross((p1-p0),(p2-p0)) in 2D
+                const float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+
+                if (area2 <= 0.0f) continue;
+            }
+            // ----------------------------------------------------------------
+		}
+
+
 
         // Create a triangle object and render it
         triangle tri(t[0], t[1], t[2]);
@@ -188,67 +237,101 @@ void scene1() {
     FrameTimer timer;
     Renderer renderer;
     matrix camera;
-    Light L{ vec4(0.f, 1.f, 1.f, 0.f), colour(1.0f, 1.0f, 1.0f), colour(0.2f, 0.2f, 0.2f) };
+    Light L{ vec4(0.f, 1.f, 1.f, 0.f),
+             colour(1.0f, 1.0f, 1.0f),
+             colour(0.2f, 0.2f, 0.2f) };
 
-    bool running = true;
+    float zoffset = 8.0f;
+    float step = -0.1f;
 
-    std::vector<Mesh*> scene;
 
-    // Create a scene of 40 cubes with random rotations
-    for (unsigned int i = 0; i < 20; i++) {
-        Mesh* m = new Mesh();
-        *m = Mesh::makeCube(1.f);
-        m->world = matrix::makeTranslation(-2.0f, 0.0f, (-3 * static_cast<float>(i))) * makeRandomRotation();
-        scene.push_back(m);
-        m = new Mesh();
-        *m = Mesh::makeCube(1.f);
-        m->world = matrix::makeTranslation(2.0f, 0.0f, (-3 * static_cast<float>(i))) * makeRandomRotation();
-        scene.push_back(m);
+    std::vector<Mesh*> scene;        // baseline
+    Mesh cube;                        // optimized
+    std::vector<matrix> worlds;      // optimized
+
+    if (!useScene1SharedMeshOPT) {
+        // -------- baseline：原始 scene1（40 个 Mesh） --------
+        for (unsigned int i = 0; i < 20; i++) {
+            Mesh* m = new Mesh();
+            *m = Mesh::makeCube(1.f);
+            m->world = matrix::makeTranslation(-2.0f, 0.0f, -3.f * i)
+                * makeRandomRotation();
+            scene.push_back(m);
+
+            m = new Mesh();
+            *m = Mesh::makeCube(1.f);
+            m->world = matrix::makeTranslation(2.0f, 0.0f, -3.f * i)
+                * makeRandomRotation();
+            scene.push_back(m);
+        }
+    }
+    else {
+        // -------- optimized：共享一个 cube mesh --------
+        cube = Mesh::makeCube(1.f);
+        worlds.reserve(40);
+
+        for (unsigned int i = 0; i < 20; i++) {
+            worlds.push_back(
+                matrix::makeTranslation(-2.0f, 0.0f, -3.f * i)
+                * makeRandomRotation()
+            );
+            worlds.push_back(
+                matrix::makeTranslation(2.0f, 0.0f, -3.f * i)
+                * makeRandomRotation()
+            );
+        }
     }
 
-    float zoffset = 8.0f; // Initial camera Z-offset
-    float step = -0.1f;  // Step size for camera movement
 
-    auto start = std::chrono::high_resolution_clock::now();
-    std::chrono::time_point<std::chrono::high_resolution_clock> end;
-    int cycle = 0;
-
-    // Main rendering loop
     while (!timer.finished()) {
         timer.beginFrame();
         renderer.canvas.checkInput();
         renderer.clear();
 
-        camera = matrix::makeTranslation(0, 0, -zoffset); // Update camera position
-
-        // Rotate the first two cubes in the scene
-        scene[0]->world = scene[0]->world * matrix::makeRotateXYZ(0.1f, 0.1f, 0.0f);
-        scene[1]->world = scene[1]->world * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
+        camera = matrix::makeTranslation(0, 0, -zoffset);
 
         if (renderer.canvas.keyPressed(VK_ESCAPE)) break;
 
         zoffset += step;
-        if (zoffset < -60.f || zoffset > 8.f) {
-            step *= -1.f;
-            if (++cycle % 2 == 0) {
-                //end = std::chrono::high_resolution_clock::now();
-                //std::cout << cycle / 2 << " :" << std::chrono::duration<double, std::milli>(end - start).count() << "ms\n";
-                //start = std::chrono::high_resolution_clock::now();
+        if (zoffset < -60.f || zoffset > 8.f) step *= -1.f;
+
+        if (!useScene1SharedMeshOPT) {
+            // -------- baseline render --------
+            scene[0]->world = scene[0]->world
+                * matrix::makeRotateXYZ(0.1f, 0.1f, 0.0f);
+            scene[1]->world = scene[1]->world
+                * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
+
+            for (auto& m : scene)
+                render(renderer, m, camera, L);
+        }
+        else {
+            // -------- optimized render --------
+            worlds[0] = worlds[0]
+                * matrix::makeRotateXYZ(0.1f, 0.1f, 0.0f);
+            worlds[1] = worlds[1]
+                * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
+
+            for (const auto& W : worlds) {
+                cube.world = W;
+                render(renderer, &cube, camera, L);
             }
         }
 
-        for (auto& m : scene)
-            render(renderer, m, camera, L);
         renderer.present();
-
         timer.endFrame();
     }
 
-    for (auto& m : scene)
-        delete m;
 
-    std::cout << "FPS: " << timer.averageFPS() << "; " << timer.averageFrameTimeMs() << " ms" << std::endl;
+    if (!useScene1SharedMeshOPT) {
+        for (auto& m : scene) delete m;
+    }
+
+    std::cout << (useScene1SharedMeshOPT ? "[OPT]" : "[BASE]")
+        << " FPS: " << timer.averageFPS()
+        << " ; " << timer.averageFrameTimeMs() << " ms\n";
 }
+
 
 // Scene with a grid of cubes and a moving sphere
 // No input variables
