@@ -13,8 +13,8 @@ class Zbuffer {
 public:
 
     //----------------- Utility functions for row access ----------------
-    float* rowPtr(int y) { return &buffer[y * width]; }
-    const float* rowPtr(int y) const { return &buffer[y * width]; }
+    T* rowPtr(int y) { return &buffer[y * width]; }
+    const T* rowPtr(int y) const { return &buffer[y * width]; }
 
 
 

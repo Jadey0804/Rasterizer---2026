@@ -57,6 +57,22 @@ class triangle {
         else return(e01 <= 0.0f && e12 <= 0.0f && e20 <= 0.0f);
     }
 
+	//------------------------- AVX2 version of the inside test -------------------------
+    static inline __m256 insideMaskAVX2(__m256 e01, __m256 e12, __m256 e20, float area2) {
+        const __m256 zero = _mm256_setzero_ps();
+        if (area2 > 0.0f) {
+            __m256 m01 = _mm256_cmp_ps(e01, zero, _CMP_GE_OQ);
+            __m256 m12 = _mm256_cmp_ps(e12, zero, _CMP_GE_OQ);
+            __m256 m20 = _mm256_cmp_ps(e20, zero, _CMP_GE_OQ);
+            return _mm256_and_ps(_mm256_and_ps(m01, m12), m20);
+        }
+        else {
+            __m256 m01 = _mm256_cmp_ps(e01, zero, _CMP_LE_OQ);
+            __m256 m12 = _mm256_cmp_ps(e12, zero, _CMP_LE_OQ);
+            __m256 m20 = _mm256_cmp_ps(e20, zero, _CMP_LE_OQ);
+            return _mm256_and_ps(_mm256_and_ps(m01, m12), m20);
+        }
+    }
 
 
 public:
@@ -178,6 +194,7 @@ public:
     void draw_edgeRaster(Renderer& renderer, Light& L, float ka, float kd) {
         vec2D minV, maxV;
 		vec4 lightDir;
+        
 
         if (useLightOPT) {
 			lightDir = L.omega_i;
@@ -243,10 +260,161 @@ public:
             float e12 = e12_row;
             float e20 = e20_row;
 
-            for (int x = minX; x < maxX; ++x) {
+            float* zrow = renderer.zbuffer.rowPtr(y); // <-- 需要你实现 rowPtr
+
+            int x = minX;
+
+            // 8-wide lane offsets [0..7]
+            const __m256 offsets = _mm256_set_ps(7, 6, 5, 4, 3, 2, 1, 0);
+            const __m256 invA = _mm256_set1_ps(invArea2);
+            const __m256 eps = _mm256_set1_ps(0.001f);
+            const __m256 zero = _mm256_setzero_ps();
+
+            // 顶点深度广播
+            const __m256 z0 = _mm256_set1_ps(v[0].p[2]);
+            const __m256 z1 = _mm256_set1_ps(v[1].p[2]);
+            const __m256 z2 = _mm256_set1_ps(v[2].p[2]);
+
+            // colour 广播（按你 colour 类字段改：这里假设 colour 有 .r .g .b）
+            const __m256 c0r = _mm256_set1_ps(v[0].rgb.r), c1r = _mm256_set1_ps(v[1].rgb.r), c2r = _mm256_set1_ps(v[2].rgb.r);
+            const __m256 c0g = _mm256_set1_ps(v[0].rgb.g), c1g = _mm256_set1_ps(v[1].rgb.g), c2g = _mm256_set1_ps(v[2].rgb.g);
+            const __m256 c0b = _mm256_set1_ps(v[0].rgb.b), c1b = _mm256_set1_ps(v[1].rgb.b), c2b = _mm256_set1_ps(v[2].rgb.b);
+
+            // normal 广播（vec4 用 [] 访问）
+            const __m256 n0x = _mm256_set1_ps(v[0].normal[0]), n1x = _mm256_set1_ps(v[1].normal[0]), n2x = _mm256_set1_ps(v[2].normal[0]);
+            const __m256 n0y = _mm256_set1_ps(v[0].normal[1]), n1y = _mm256_set1_ps(v[1].normal[1]), n2y = _mm256_set1_ps(v[2].normal[1]);
+            const __m256 n0z = _mm256_set1_ps(v[0].normal[2]), n1z = _mm256_set1_ps(v[1].normal[2]), n2z = _mm256_set1_ps(v[2].normal[2]);
+
+            // lightDir：你已经在 draw_edgeRaster 外面处理 useLightOPT，这里要求 lightDir 已经 normalise 好
+            const __m256 lx = _mm256_set1_ps(lightDir[0]);
+            const __m256 ly = _mm256_set1_ps(lightDir[1]);
+            const __m256 lz = _mm256_set1_ps(lightDir[2]);
+
+            // Light 颜色广播（按你 colour 字段改）
+            const __m256 LLr = _mm256_set1_ps(L.L.r);
+            const __m256 LLg = _mm256_set1_ps(L.L.g);
+            const __m256 LLb = _mm256_set1_ps(L.L.b);
+
+            const __m256 AMr = _mm256_set1_ps(L.ambient.r);
+            const __m256 AMg = _mm256_set1_ps(L.ambient.g);
+            const __m256 AMb = _mm256_set1_ps(L.ambient.b);
+
+            const __m256 kdV = _mm256_set1_ps(kd);
+            const __m256 kaV = _mm256_set1_ps(ka);
+
+            // 主循环：每次 8 像素
+            for (; x + 7 < maxX; x += 8) {
+                // E(x+i)=E + i*dx
+                __m256 E01 = _mm256_add_ps(_mm256_set1_ps(e01), _mm256_mul_ps(offsets, _mm256_set1_ps(e01_dx)));
+                __m256 E12 = _mm256_add_ps(_mm256_set1_ps(e12), _mm256_mul_ps(offsets, _mm256_set1_ps(e12_dx)));
+                __m256 E20 = _mm256_add_ps(_mm256_set1_ps(e20), _mm256_mul_ps(offsets, _mm256_set1_ps(e20_dx)));
+
+                __m256 mInside = insideMaskAVX2(E01, E12, E20, area2);
+                int insideBits = _mm256_movemask_ps(mInside);
+                if (!insideBits) {
+                    // 组步进：等价标量加 8 次
+                    e01 += 8.0f * e01_dx;
+                    e12 += 8.0f * e12_dx;
+                    e20 += 8.0f * e20_dx;
+                    continue;
+                }
+
+                // barycentric：w0=E12/area2,w1=E20/area2,w2=E01/area2
+                __m256 w0 = _mm256_mul_ps(E12, invA);
+                __m256 w1 = _mm256_mul_ps(E20, invA);
+                __m256 w2 = _mm256_mul_ps(E01, invA);
+
+                // depth
+                __m256 depth = _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(w0, z0), _mm256_mul_ps(w1, z1)),
+                    _mm256_mul_ps(w2, z2)
+                );
+
+                __m256 zold = _mm256_loadu_ps(zrow + x);
+
+                __m256 mZ = _mm256_cmp_ps(zold, depth, _CMP_GT_OQ);
+                __m256 mEps = _mm256_cmp_ps(depth, eps, _CMP_GT_OQ);
+
+                __m256 mPass = _mm256_and_ps(_mm256_and_ps(mInside, mZ), mEps);
+                int passBits = _mm256_movemask_ps(mPass);
+                if (!passBits) {
+                    e01 += 8.0f * e01_dx;
+                    e12 += 8.0f * e12_dx;
+                    e20 += 8.0f * e20_dx;
+                    continue;
+                }
+
+                // colour 插值
+                __m256 r = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, c0r), _mm256_mul_ps(w1, c1r)), _mm256_mul_ps(w2, c2r));
+                __m256 g = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, c0g), _mm256_mul_ps(w1, c1g)), _mm256_mul_ps(w2, c2g));
+                __m256 b = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, c0b), _mm256_mul_ps(w1, c1b)), _mm256_mul_ps(w2, c2b));
+
+                // clamp 0..1
+                const __m256 one = _mm256_set1_ps(1.0f);
+                r = _mm256_min_ps(_mm256_max_ps(r, zero), one);
+                g = _mm256_min_ps(_mm256_max_ps(g, zero), one);
+                b = _mm256_min_ps(_mm256_max_ps(b, zero), one);
+
+                // normal 插值 + normalize
+                __m256 nx = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, n0x), _mm256_mul_ps(w1, n1x)), _mm256_mul_ps(w2, n2x));
+                __m256 ny = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, n0y), _mm256_mul_ps(w1, n1y)), _mm256_mul_ps(w2, n2y));
+                __m256 nz = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(w0, n0z), _mm256_mul_ps(w1, n1z)), _mm256_mul_ps(w2, n2z));
+
+                __m256 len2 = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(nx, nx), _mm256_mul_ps(ny, ny)), _mm256_mul_ps(nz, nz));
+                __m256 invLen = _mm256_rsqrt_ps(len2);
+
+                // 牛顿迭代一次（精度更稳）
+                const __m256 half = _mm256_set1_ps(0.5f);
+                const __m256 one5 = _mm256_set1_ps(1.5f);
+                invLen = _mm256_mul_ps(invLen,
+                    _mm256_sub_ps(one5,
+                        _mm256_mul_ps(half, _mm256_mul_ps(len2, _mm256_mul_ps(invLen, invLen)))));
+
+                nx = _mm256_mul_ps(nx, invLen);
+                ny = _mm256_mul_ps(ny, invLen);
+                nz = _mm256_mul_ps(nz, invLen);
+
+                // dot + clamp
+                __m256 dot = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(nx, lx), _mm256_mul_ps(ny, ly)), _mm256_mul_ps(nz, lz));
+                dot = _mm256_max_ps(dot, zero);
+
+                // shading： (c*kd)*(L.L*dot) + ambient*ka
+                __m256 outR = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(r, kdV), LLr), dot), _mm256_mul_ps(AMr, kaV));
+                __m256 outG = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(g, kdV), LLg), dot), _mm256_mul_ps(AMg, kaV));
+                __m256 outB = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(b, kdV), LLb), dot), _mm256_mul_ps(AMb, kaV));
+
+                outR = _mm256_min_ps(_mm256_max_ps(outR, zero), one);
+                outG = _mm256_min_ps(_mm256_max_ps(outG, zero), one);
+                outB = _mm256_min_ps(_mm256_max_ps(outB, zero), one);
+
+                // z 写回（masked store）
+                __m256i mPassI = _mm256_castps_si256(mPass);
+                _mm256_maskstore_ps(zrow + x, mPassI, depth);
+
+                // 颜色写回：你目前只能用 draw()，因此按 mask 标量写（计算 SIMD，写回标量）
+                alignas(32) float rr[8], gg[8], bb[8];
+                _mm256_store_ps(rr, outR);
+                _mm256_store_ps(gg, outG);
+                _mm256_store_ps(bb, outB);
+
+                for (int lane = 0; lane < 8; ++lane) {
+                    if (passBits & (1 << lane)) {
+                        unsigned char R = (unsigned char)(rr[lane] * 255.0f);
+                        unsigned char G = (unsigned char)(gg[lane] * 255.0f);
+                        unsigned char B = (unsigned char)(bb[lane] * 255.0f);
+                        renderer.canvas.draw(x + lane, y, R, G, B);
+                    }
+                }
+
+                // 组步进
+                e01 += 8.0f * e01_dx;
+                e12 += 8.0f * e12_dx;
+                e20 += 8.0f * e20_dx;
+            }
+
+            // tail：剩余像素用你原本标量版本
+            for (; x < maxX; ++x) {
                 if (isInside(e01, e12, e20, area2)) {
-                    // barycentric：w0 对 v0, w1 对 v1, w2 对 v2
-                    // 常用对应：w0 = E12/area2, w1 = E20/area2, w2 = E01/area2
                     const float w0 = e12 * invArea2;
                     const float w1 = e20 * invArea2;
                     const float w2 = e01 * invArea2;
@@ -255,46 +423,40 @@ public:
                     const float gamma = w1;
                     const float alpha = w2;
 
-                    //early-z 253fps
-                    
                     float depth = interpolate(beta, gamma, alpha, v[0].p[2], v[1].p[2], v[2].p[2]);
 
                     if ((renderer.zbuffer(x, y) > depth && depth > 0.001f)) {
-
                         colour c = interpolate(beta, gamma, alpha, v[0].rgb, v[1].rgb, v[2].rgb);
                         c.clampColour();
 
                         vec4 normal = interpolate(beta, gamma, alpha, v[0].normal, v[1].normal, v[2].normal);
                         normal.normalise();
 
-
-                        //做了early-Z之后少了一部分计算，现在对比不干净了
                         if (!useLightOPT) {
                             lightDir = L.omega_i;
                             lightDir.normalise();
                         }
 
-                        float dot = std::max(vec4::dot(lightDir, normal), 0.0f);
-                        colour a = (c * kd) * (L.L * dot) + (L.ambient * ka);
+                        float dotS = std::max(vec4::dot(lightDir, normal), 0.0f);
+                        colour a = (c * kd) * (L.L * dotS) + (L.ambient * ka);
 
-                        unsigned char r, g, b;
-                        a.toRGB(r, g, b);
-                        renderer.canvas.draw(x, y, r, g, b);
+                        unsigned char R, G, B;
+                        a.toRGB(R, G, B);
+                        renderer.canvas.draw(x, y, R, G, B);
                         renderer.zbuffer(x, y) = depth;
                     }
                 }
 
-                // x+1：边函数增量更新（只加法）
                 e01 += e01_dx;
                 e12 += e12_dx;
                 e20 += e20_dx;
             }
 
-            // y+1：行起点增量更新
             e01_row += e01_dy;
             e12_row += e12_dy;
             e20_row += e20_dy;
         }
+
     }
 
 

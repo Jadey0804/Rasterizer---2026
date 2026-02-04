@@ -6,6 +6,7 @@
 // The `colour` class represents an RGB colour with floating-point precision.
 // It provides various utilities for manipulating and converting colours.
 class colour {
+public: 
     union {
         struct {
             float r, g, b; // Red, Green, and Blue components of the colour
