@@ -11,6 +11,13 @@ class Zbuffer {
     unsigned int width, height; // Dimensions of the Z-buffer
 
 public:
+
+    //----------------- Utility functions for row access ----------------
+    float* rowPtr(int y) { return &buffer[y * width]; }
+    const float* rowPtr(int y) const { return &buffer[y * width]; }
+
+
+
     // Constructor to initialize a Z-buffer with the given width and height.
     // Allocates memory for the buffer.
     // Input Variables:

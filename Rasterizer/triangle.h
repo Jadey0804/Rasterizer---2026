@@ -9,6 +9,8 @@
 #include <cmath>
 
 #include "BuildConfig.h"
+#include <immintrin.h>
+
 
 // Simple support class for a 2D vector
 class vec2D {
@@ -54,6 +56,7 @@ class triangle {
         if (area2 > 0.0f)return(e01 >= 0.0f && e12 >= 0.0f && e20 >= 0.0f);
         else return(e01 <= 0.0f && e12 <= 0.0f && e20 <= 0.0f);
     }
+
 
 
 public:
@@ -252,21 +255,25 @@ public:
                     const float gamma = w1;
                     const float alpha = w2;
 
-                    colour c = interpolate(beta, gamma, alpha, v[0].rgb, v[1].rgb, v[2].rgb);
-                    c.clampColour();
-
+                    //early-z 253fps
+                    
                     float depth = interpolate(beta, gamma, alpha, v[0].p[2], v[1].p[2], v[2].p[2]);
 
-                    vec4 normal = interpolate(beta, gamma, alpha, v[0].normal, v[1].normal, v[2].normal);
-					normal.normalise();
+                    if ((renderer.zbuffer(x, y) > depth && depth > 0.001f)) {
 
-                    if (renderer.zbuffer(x, y) > depth && depth > 0.001f) {
-                       
+                        colour c = interpolate(beta, gamma, alpha, v[0].rgb, v[1].rgb, v[2].rgb);
+                        c.clampColour();
+
+                        vec4 normal = interpolate(beta, gamma, alpha, v[0].normal, v[1].normal, v[2].normal);
+                        normal.normalise();
+
+
+                        //做了early-Z之后少了一部分计算，现在对比不干净了
                         if (!useLightOPT) {
                             lightDir = L.omega_i;
                             lightDir.normalise();
-						}
-                        
+                        }
+
                         float dot = std::max(vec4::dot(lightDir, normal), 0.0f);
                         colour a = (c * kd) * (L.L * dot) + (L.ambient * ka);
 
