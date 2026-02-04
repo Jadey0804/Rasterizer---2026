@@ -161,6 +161,7 @@ public:
                         float dot = std::max(vec4::dot(lightDir, normal), 0.0f);
                         colour a = (c * kd) * (L.L * dot) + (L.ambient * ka); // using kd instead of ka for ambient
                         // typical shader end
+
                         unsigned char r, g, b;
                         a.toRGB(r, g, b);
                         renderer.canvas.draw(x, y, r, g, b);
@@ -179,8 +180,6 @@ public:
 			lightDir = L.omega_i;
 			lightDir.normalise();
         }
-
-
 
         getBoundsWindow(renderer.canvas, minV, maxV);
 
@@ -228,8 +227,8 @@ public:
         }
 
         // 起始采样点
-        const float startX = (float)minX;
-        const float startY = (float)minY;
+        const float startX = (float)minX + 0.5;
+        const float startY = (float)minY + 0.5;
 
         // 行起点的边函数值（只算一次）
         float e01_row = edgeFn(x0, y0, x1, y1, startX, startY);

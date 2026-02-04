@@ -19,6 +19,8 @@
 #include "Timer.h"
 
 #include "BuildConfig.h"
+#include <immintrin.h>
+#include <vector>
 
 // Main rendering function that processes a mesh, transforms its vertices, applies lighting, and draws triangles on the canvas.
 // Input Variables:
@@ -27,7 +29,156 @@
 // - camera: Matrix representing the camera's transformation.
 // - L: Light object representing the lighting parameters.
 
+static inline void getMatrixElems(const matrix& M,
+    float& m00, float& m01, float& m02, float& m03,
+    float& m10, float& m11, float& m12, float& m13,
+    float& m20, float& m21, float& m22, float& m23,
+    float& m30, float& m31, float& m32, float& m33)
+{
+    m00 = M.get(0, 0); m01 = M.get(0, 1); m02 = M.get(0, 2); m03 = M.get(0, 3);
+    m10 = M.get(1, 0); m11 = M.get(1, 1); m12 = M.get(1, 2); m13 = M.get(1, 3);
+    m20 = M.get(2, 0); m21 = M.get(2, 1); m22 = M.get(2, 2); m23 = M.get(2, 3);
+    m30 = M.get(3, 0); m31 = M.get(3, 1); m32 = M.get(3, 2); m33 = M.get(3, 3);
+}
+
+
+void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
+    const matrix P = renderer.perspective * camera * mesh->world;
+
+    float m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33;
+    getMatrixElems(P, m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33);
+
+    const size_t N = mesh->vertices.size();
+    static thread_local std::vector<Vertex> tv;
+    tv.resize(N);
+
+    // SOA input
+    static thread_local std::vector<float> px, py, pz, pw;
+    px.resize(N); py.resize(N); pz.resize(N); pw.resize(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        const vec4& p = mesh->vertices[i].p;
+        px[i] = p[0]; 
+        py[i] = p[1]; 
+        pz[i] = p[2];
+        pw[i] = p[3]; // 若你的 w 恒 1，可直接 pw[i]=1.f
+    }
+
+    const float W = (float)renderer.canvas.getWidth();
+    const float H = (float)renderer.canvas.getHeight();
+
+    const __m256 m00v = _mm256_set1_ps(m00), m01v = _mm256_set1_ps(m01), m02v = _mm256_set1_ps(m02), m03v = _mm256_set1_ps(m03);
+    const __m256 m10v = _mm256_set1_ps(m10), m11v = _mm256_set1_ps(m11), m12v = _mm256_set1_ps(m12), m13v = _mm256_set1_ps(m13);
+    const __m256 m20v = _mm256_set1_ps(m20), m21v = _mm256_set1_ps(m21), m22v = _mm256_set1_ps(m22), m23v = _mm256_set1_ps(m23);
+    const __m256 m30v = _mm256_set1_ps(m30), m31v = _mm256_set1_ps(m31), m32v = _mm256_set1_ps(m32), m33v = _mm256_set1_ps(m33);
+
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 Wv = _mm256_set1_ps(W);
+    const __m256 Hv = _mm256_set1_ps(H);
+
+
+    // 先把 tv[i] 初始化好：拷贝 rgb，并把 normal 提前处理（标量）
+    for (size_t i = 0; i < N; ++i) {
+        tv[i] = mesh->vertices[i]; // 拷贝 rgb/normal/其它属性（不拷贝也行，但最省事）
+
+        // normal 变换 & normalize：移到 SIMD loop 外
+        tv[i].normal = mesh->world * mesh->vertices[i].normal;
+        tv[i].normal.normalise();
+    }
+
+    size_t i = 0;
+	// 
+    for (; i + 7 < N; i += 8) {
+		// Matrix-vector multiplication using AVX2
+        __m256 x = _mm256_loadu_ps(&px[i]);
+        __m256 y = _mm256_loadu_ps(&py[i]);
+        __m256 z = _mm256_loadu_ps(&pz[i]);
+        __m256 w = _mm256_loadu_ps(&pw[i]);
+
+        // clip = M * [x y z w]
+        __m256 cx = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(m00v, x), _mm256_mul_ps(m01v, y)),
+            _mm256_add_ps(_mm256_mul_ps(m02v, z), _mm256_mul_ps(m03v, w)));
+
+        __m256 cy = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(m10v, x), _mm256_mul_ps(m11v, y)),
+            _mm256_add_ps(_mm256_mul_ps(m12v, z), _mm256_mul_ps(m13v, w)));
+
+        __m256 cz = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(m20v, x), _mm256_mul_ps(m21v, y)),
+            _mm256_add_ps(_mm256_mul_ps(m22v, z), _mm256_mul_ps(m23v, w)));
+
+        __m256 cw = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(m30v, x), _mm256_mul_ps(m31v, y)),
+            _mm256_add_ps(_mm256_mul_ps(m32v, z), _mm256_mul_ps(m33v, w)));
+
+		// Divide by W (perspective divide)
+        // invW = 1/cw
+        __m256 invW = _mm256_div_ps(one, cw);
+
+		// Map to NDC space
+        // ndc
+        __m256 ndcX = _mm256_mul_ps(cx, invW);
+        __m256 ndcY = _mm256_mul_ps(cy, invW);
+        __m256 ndcZ = _mm256_mul_ps(cz, invW);
+
+        // screen mapping: sx=(ndcX+1)*0.5*W, sy=H - (ndcY+1)*0.5*H
+        __m256 sx = _mm256_mul_ps(_mm256_mul_ps(_mm256_add_ps(ndcX, one), half), Wv);
+        __m256 sy = _mm256_sub_ps(Hv, _mm256_mul_ps(_mm256_mul_ps(_mm256_add_ps(ndcY, one), half), Hv));
+
+        // store back to tv (AOS)
+        alignas(32) float sxArr[8], syArr[8], szArr[8];
+        _mm256_store_ps(sxArr, sx);
+        _mm256_store_ps(syArr, sy);
+        _mm256_store_ps(szArr, ndcZ);
+
+        //--------------------------
+        for (int k = 0; k < 8; ++k) {
+            tv[i + k].p[0] = sxArr[k];
+            tv[i + k].p[1] = syArr[k];
+            tv[i + k].p[2] = szArr[k];
+        }
+
+    }
+
+    // tail scalar
+    for (; i < N; ++i) {
+        vec4 p = P * mesh->vertices[i].p;
+        p.divideW();
+
+        p[0] = (p[0] + 1.f) * 0.5f * W;
+        p[1] = (p[1] + 1.f) * 0.5f * H;
+        p[1] = H - p[1];
+
+        tv[i].p[0] = p[0];
+        tv[i].p[1] = p[1];
+        tv[i].p[2] = p[2];
+    }
+
+
+    // triangle loop unchanged (use tv)
+    for (triIndices& ind : mesh->triangles) {
+        const Vertex& v0 = tv[ind.v[0]];
+        const Vertex& v1 = tv[ind.v[1]];
+        const Vertex& v2 = tv[ind.v[2]];
+
+        if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+
+        triangle tri(v0, v1, v2);
+        tri.draw(renderer, L, mesh->ka, mesh->kd);
+    }
+}
+
+
+
 void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
+
+    if (useSIMD) {
+        renderOPT_AVX2(renderer, mesh, camera, L);
+        return;
+	}
+    
     // Combine perspective, camera, and world transformations for the mesh
     const matrix p = renderer.perspective * camera * mesh->world;
 
@@ -78,7 +229,6 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
                 float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
 
-                // 注意：如果你发现正面全没了，就把 <= 0 改成 >= 0
                 if (area2 <= 0.0f) continue;
             }
             // -----------------------------------------------
@@ -373,6 +523,7 @@ void scene2() {
     int cycle = 0;
 
     bool running = true;
+
     while (!timer.finished()) {
         timer.beginFrame();
         renderer.canvas.checkInput();
@@ -415,8 +566,8 @@ void scene2() {
 // No input variables
 int main() {
     // Uncomment the desired scene function to run
-    scene1();
-    //scene2();
+    //scene1();
+    scene2();
     //sceneTest(); 
     
 

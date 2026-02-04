@@ -12,6 +12,9 @@ class matrix {
     };
 
 public:
+
+    float get(int r, int c) const { return m[r][c]; }
+
     // Default constructor initializes the matrix as an identity matrix
     matrix() {
         identity();
