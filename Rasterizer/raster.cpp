@@ -21,6 +21,7 @@
 #include "BuildConfig.h"
 #include <immintrin.h>
 #include <vector>
+#include"ThreadPool.h"
 
 // Main rendering function that processes a mesh, transforms its vertices, applies lighting, and draws triangles on the canvas.
 // Input Variables:
@@ -42,14 +43,16 @@ static inline void getMatrixElems(const matrix& M,
 }
 
 
-void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
+void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, ThreadPool* pool) {
+
     const matrix P = renderer.perspective * camera * mesh->world;
 
     float m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33;
     getMatrixElems(P, m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33);
 
     const size_t N = mesh->vertices.size();
-    static thread_local std::vector<Vertex> tv;
+	//static thread_local std::vector<Vertex> tv;
+    std::vector<Vertex> tv;
     tv.resize(N);
 
     // SOA input
@@ -157,27 +160,77 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
     }
 
 
-    // triangle loop unchanged (use tv)
-    for (triIndices& ind : mesh->triangles) {
-        const Vertex& v0 = tv[ind.v[0]];
-        const Vertex& v1 = tv[ind.v[1]];
-        const Vertex& v2 = tv[ind.v[2]];
+    // --- after tv is ready ---
 
-        if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+    const int Wi = (int)renderer.canvas.getWidth();
+    const int Hi = (int)renderer.canvas.getHeight();
 
-        triangle tri(v0, v1, v2);
-        tri.draw(renderer, L, mesh->ka, mesh->kd);
+    const int tileW = mtTileW;
+    const int tileH = mtTileH;
+    const int tilesX = (Wi + tileW - 1) / tileW;
+    const int tilesY = (Hi + tileH - 1) / tileH;
+    const int tileCount = tilesX * tilesY;
+
+    // --- Triangle binning: tile -> list of triangle indices ---
+    static std::vector<std::vector<uint32_t>> tileBins;
+    tileBins.resize(tileCount);
+    for (auto& b : tileBins) b.clear(); // 每帧清空桶（保留 capacity）
+
+
+
+    // 单线程 fallback（用于对比/或者关掉 MT）
+    if (!useMT || pool == nullptr || pool->size() <= 1) {
+        for (const triIndices& ind : mesh->triangles) {
+            const Vertex& v0 = tv[ind.v[0]];
+            const Vertex& v1 = tv[ind.v[1]];
+            const Vertex& v2 = tv[ind.v[2]];
+            if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+
+            triangle tri(v0, v1, v2);
+            tri.draw(renderer, L, mesh->ka, mesh->kd, nullptr); // 无 scissor
+        }
+        return;
     }
+
+
+
+
+
+
+    // MT tile raster
+    pool->parallel_for(0, (size_t)tileCount, [&](size_t tid) {
+        const int tx = (int)(tid % tilesX);
+        const int ty = (int)(tid / tilesX);
+
+        Scissor s{
+            tx * tileW,
+            ty * tileH,
+            std::min(Wi, tx * tileW + tileW),
+            std::min(Hi, ty * tileH + tileH)
+        };
+
+        for (const triIndices& ind : mesh->triangles) {
+            const Vertex& v0 = tv[ind.v[0]];
+            const Vertex& v1 = tv[ind.v[1]];
+            const Vertex& v2 = tv[ind.v[2]];
+
+            if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
+
+            triangle tri(v0, v1, v2);
+            tri.draw(renderer, L, mesh->ka, mesh->kd, &s);
+        }
+        }, /*grain=*/1);
+
 }
 
 
 
 void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
-    if (useSIMD) {
-        renderOPT_AVX2(renderer, mesh, camera, L);
-        return;
-	}
+ //   if (useSIMD) {
+ //       renderOPT_AVX2(renderer, mesh, camera, L, pool);
+ //       return;
+	//}
     
     // Combine perspective, camera, and world transformations for the mesh
     const matrix p = renderer.perspective * camera * mesh->world;
@@ -259,7 +312,7 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
     if (useRenderOPT) {
-        renderOPT(renderer, mesh, camera, L);
+        renderOPT(renderer, mesh, camera, L );
         return;
     }
 
@@ -307,9 +360,6 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
             }
             // ----------------------------------------------------------------
 		}
-
-
-
         // Create a triangle object and render it
         triangle tri(t[0], t[1], t[2]);
         tri.draw(renderer, L, mesh->ka, mesh->kd);
@@ -320,6 +370,7 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 // No input variables
 void sceneTest() {
     Renderer renderer;
+	ThreadPool pool;
     // create light source {direction, diffuse intensity, ambient intensity}
     Light L{ vec4(0.f, 1.f, 1.f, 0.f), colour(1.0f, 1.0f, 1.0f), colour(0.2f, 0.2f, 0.2f) };
     // camera is just a matrix
@@ -391,6 +442,25 @@ void scene1() {
              colour(1.0f, 1.0f, 1.0f),
              colour(0.2f, 0.2f, 0.2f) };
 
+    const int W = (int)renderer.canvas.getWidth();
+    const int H = (int)renderer.canvas.getHeight();
+
+    const int tileW = mtTileW;
+    const int tileH = mtTileH;
+    const int tilesX = (W + tileW - 1) / tileW;
+    const int tilesY = (H + tileH - 1) / tileH;
+    const int tileCount = tilesX * tilesY;
+
+    size_t threads = mtThreadCount;
+    if (threads == 0) {
+        threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
+        if (threads == 0) threads = 1;
+    }
+
+    std::unique_ptr<ThreadPool> pool;
+    if (useMT && threads > 1) pool = std::make_unique<ThreadPool>(threads);
+
+
     float zoffset = 8.0f;
     float step = -0.1f;
 
@@ -452,8 +522,18 @@ void scene1() {
             scene[1]->world = scene[1]->world
                 * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
 
-            for (auto& m : scene)
-                render(renderer, m, camera, L);
+            for (auto& m : scene) {
+                if (useRenderOPT && useSIMD) {
+                    renderOPT_AVX2(renderer, m, camera, L, pool ? pool.get() : nullptr);
+                }
+                else if (useRenderOPT) {
+                    renderOPT(renderer, m, camera, L);
+                }
+                else {
+                    render(renderer, m, camera, L);
+                }
+            }
+
         }
         else {
             // -------- optimized render --------
@@ -464,8 +544,18 @@ void scene1() {
 
             for (const auto& W : worlds) {
                 cube.world = W;
-                render(renderer, &cube, camera, L);
+
+                if (useRenderOPT && useSIMD) {
+                    renderOPT_AVX2(renderer, &cube, camera, L, pool ? pool.get() : nullptr);
+                }
+                else if (useRenderOPT) {
+                    renderOPT(renderer, &cube, camera, L);
+                }
+                else {
+                    render(renderer, &cube, camera, L);
+                }
             }
+
         }
 
         renderer.present();
@@ -488,6 +578,7 @@ void scene1() {
 void scene2() {
     FrameTimer timer;
     Renderer renderer;
+	ThreadPool pool;
     matrix camera = matrix::makeIdentity();
     Light L{ vec4(0.f, 1.f, 1.f, 0.f), colour(1.0f, 1.0f, 1.0f), colour(0.2f, 0.2f, 0.2f) };
 
@@ -566,8 +657,8 @@ void scene2() {
 // No input variables
 int main() {
     // Uncomment the desired scene function to run
-    // scene1();
-    scene2();
+    scene1();
+    //scene2();
     //sceneTest(); 
     
 

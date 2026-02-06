@@ -12,6 +12,13 @@
 #include <immintrin.h>
 
 
+//------------------ Scissor rectangle for clipping -------------------------
+struct Scissor {
+    int x0, y0, x1, y1; // 半开区间 [x0,x1) [y0,y1)
+};
+
+
+
 // Simple support class for a 2D vector
 class vec2D {
 public:
@@ -131,9 +138,9 @@ public:
     // - renderer: Renderer object for drawing
     // - L: Light object for shading calculations
     // - ka, kd: Ambient and diffuse lighting coefficients
-    void draw(Renderer& renderer, Light& L, float ka, float kd) {
+    void draw(Renderer& renderer, Light& L, float ka, float kd, const Scissor* scissor = nullptr) {
         if (useEdgeRaster) {
-            draw_edgeRaster(renderer, L, ka, kd);
+            draw_edgeRaster(renderer, L, ka, kd,scissor);
             return;
         }
 
@@ -191,69 +198,142 @@ public:
         }
     }
 
-    void draw_edgeRaster(Renderer& renderer, Light& L, float ka, float kd) {
+    void draw_edgeRaster(Renderer& renderer, Light& L, float ka, float kd, const Scissor* scissor = nullptr) {
+  //      vec2D minV, maxV;
+		//vec4 lightDir;
+  //      
+
+  //      if (useLightOPT) {
+		//	lightDir = L.omega_i;
+		//	lightDir.normalise();
+  //      }
+
+  //      getBoundsWindow(renderer.canvas, minV, maxV);
+
+  //      // Skip very small triangles (用 area2 版本也可以，但沿用你的逻辑)
+  //      if (area < 1.f) return;
+
+  //      const float x0 = v[0].p[0], y0 = v[0].p[1];
+  //      const float x1 = v[1].p[0], y1 = v[1].p[1];
+  //      const float x2 = v[2].p[0], y2 = v[2].p[1];
+
+  //      // 用像素中心采样，避免边界漏点（如果你想和 baseline 完全一致，可以去掉 +0.5）
+  //      int minX = (int)minV.x;
+  //      int minY = (int)minV.y;
+  //      int maxX = (int)ceil(maxV.x);
+  //      int maxY = (int)ceil(maxV.y);
+
+  //      // 防止越界（getBoundsWindow 已裁剪过，但这里再保险一次）
+  //      minX = std::max(minX, 0);
+  //      minY = std::max(minY, 0);
+  //      maxX = std::min(maxX, (int)renderer.canvas.getWidth());
+  //      maxY = std::min(maxY, (int)renderer.canvas.getHeight());
+
+  //      // ---- Tile scissor clip (for multithreaded raster) ------------------
+  //      if (scissor) {
+  //          minX = std::max(minX, scissor->x0);
+  //          minY = std::max(minY, scissor->y0);
+  //          maxX = std::min(maxX, scissor->x1);
+  //          maxY = std::min(maxY, scissor->y1);
+  //          if (minX >= maxX || minY >= maxY) return;
+  //      }
+
+
+
+  //      // 计算有向面积 area2（注意：不是 fabs）
+  //      const float area2 = edgeFn(x0, y0, x1, y1, x2, y2);
+  //      if (area2 == 0.0f) return;
+  //      const float invArea2 = 1.0f / area2; // 只做一次除法
+
+  //      // 三条边的增量（x+1 加 dx；y+1 加 dy）
+  //      const float e01_dx = (y0 - y1);
+  //      const float e01_dy = (x1 - x0);
+
+  //      const float e12_dx = (y1 - y2);
+  //      const float e12_dy = (x2 - x1);
+
+  //      const float e20_dx = (y2 - y0);
+  //      const float e20_dy = (x0 - x2);
+
+  //      // 光方向 normalize
+  //     
+  //      if (!useLightOPT) {
+  //          lightDir.normalise();
+  //      }
+  //      else {
+  //          lightDir.normalise();
+  //      }
+
+  //      // 起始采样点
+  //      const float startX = (float)minX + 0.5;
+  //      const float startY = (float)minY + 0.5;
+
+  //      // 行起点的边函数值（只算一次）
+  //      float e01_row = edgeFn(x0, y0, x1, y1, startX, startY);
+  //      float e12_row = edgeFn(x1, y1, x2, y2, startX, startY);
+  //      float e20_row = edgeFn(x2, y2, x0, y0, startX, startY);
+
+
         vec2D minV, maxV;
-		vec4 lightDir;
-        
+        vec4 lightDir;
 
         if (useLightOPT) {
-			lightDir = L.omega_i;
-			lightDir.normalise();
+            lightDir = L.omega_i;
+            lightDir.normalise();
         }
 
         getBoundsWindow(renderer.canvas, minV, maxV);
 
-        // Skip very small triangles (用 area2 版本也可以，但沿用你的逻辑)
         if (area < 1.f) return;
 
         const float x0 = v[0].p[0], y0 = v[0].p[1];
         const float x1 = v[1].p[0], y1 = v[1].p[1];
         const float x2 = v[2].p[0], y2 = v[2].p[1];
 
-        // 用像素中心采样，避免边界漏点（如果你想和 baseline 完全一致，可以去掉 +0.5）
         int minX = (int)minV.x;
         int minY = (int)minV.y;
         int maxX = (int)ceil(maxV.x);
         int maxY = (int)ceil(maxV.y);
 
-        // 防止越界（getBoundsWindow 已裁剪过，但这里再保险一次）
+        // screen clip
         minX = std::max(minX, 0);
         minY = std::max(minY, 0);
         maxX = std::min(maxX, (int)renderer.canvas.getWidth());
         maxY = std::min(maxY, (int)renderer.canvas.getHeight());
 
-        // 计算有向面积 area2（注意：不是 fabs）
+        // ---- Tile scissor clip (NEW) ----
+        if (scissor) {
+            minX = std::max(minX, scissor->x0);
+            minY = std::max(minY, scissor->y0);
+            maxX = std::min(maxX, scissor->x1);
+            maxY = std::min(maxY, scissor->y1);
+            if (minX >= maxX || minY >= maxY) return;
+        }
+
         const float area2 = edgeFn(x0, y0, x1, y1, x2, y2);
         if (area2 == 0.0f) return;
-        const float invArea2 = 1.0f / area2; // 只做一次除法
+        const float invArea2 = 1.0f / area2;
 
-        // 三条边的增量（x+1 加 dx；y+1 加 dy）
         const float e01_dx = (y0 - y1);
         const float e01_dy = (x1 - x0);
-
         const float e12_dx = (y1 - y2);
         const float e12_dy = (x2 - x1);
-
         const float e20_dx = (y2 - y0);
         const float e20_dy = (x0 - x2);
 
-        // 光方向 normalize
-       
-        if (!useLightOPT) {
-            lightDir.normalise();
-        }
-        else {
-            lightDir.normalise();
-        }
+        // lightDir normalize (你这里逻辑重复，保留原样也能跑)
+        lightDir.normalise();
 
-        // 起始采样点
-        const float startX = (float)minX + 0.5;
-        const float startY = (float)minY + 0.5;
+        // start sample must match clipped minX/minY
+        const float startX = (float)minX + 0.5f;
+        const float startY = (float)minY + 0.5f;
 
-        // 行起点的边函数值（只算一次）
         float e01_row = edgeFn(x0, y0, x1, y1, startX, startY);
         float e12_row = edgeFn(x1, y1, x2, y2, startX, startY);
         float e20_row = edgeFn(x2, y2, x0, y0, startX, startY);
+
+
+        /////////////////////////
 
         for (int y = minY; y < maxY; ++y) {
             float e01 = e01_row;
