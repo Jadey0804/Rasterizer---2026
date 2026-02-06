@@ -3,9 +3,10 @@
 // Each tile has its own bounding box; avoid false sharing by writing to separate rows/tiles.
 
 #include "ThreadPool.h"
+#include "BuildConfig.h"
 
 void rasterizeFrame(ThreadPool& pool, int width, int height) {
-    const int tileW = 32, tileH = 16;
+    const int tileW = mtTileW, tileH = mtTileH;
     const int tilesX = (width + tileW - 1) / tileW;
     const int tilesY = (height + tileH - 1) / tileH;
 
@@ -18,5 +19,5 @@ void rasterizeFrame(ThreadPool& pool, int width, int height) {
         int y1 = std::min(y0 + tileH, height);
 
         // rasterizeTrianglesIntoRect(x0, y0, x1, y1);
-        }, /*grain=*/1);
+        }, grain);
 }

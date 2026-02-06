@@ -219,7 +219,7 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
             triangle tri(v0, v1, v2);
             tri.draw(renderer, L, mesh->ka, mesh->kd, &s);
         }
-        }, /*grain=*/1);
+        }, grain);
 
 }
 
