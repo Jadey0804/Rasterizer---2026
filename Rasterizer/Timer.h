@@ -4,7 +4,7 @@
 
 class FrameTimer {
 public:
-    FrameTimer(int warmupFrames = 2000, int measureFrames = 10000)
+    FrameTimer(int warmupFrames = 3000, int measureFrames = 23000)
         : warmupFrames(warmupFrames),
         measureFrames(measureFrames) {
     }

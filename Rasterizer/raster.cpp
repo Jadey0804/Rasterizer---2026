@@ -42,6 +42,70 @@ static inline void getMatrixElems(const matrix& M,
     m30 = M.get(3, 0); m31 = M.get(3, 1); m32 = M.get(3, 2); m33 = M.get(3, 3);
 }
 
+// 辅助函数：执行顶点变换的 SIMD 版本
+void transformVerticesAVX(Mesh* mesh, const matrix& MVP, const matrix& World, int W, int H, std::vector<Vertex>& outTv) {
+    const size_t N = mesh->vertices.size();
+    outTv.resize(N);
+
+    // 矩阵元素提取
+    float m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33;
+    getMatrixElems(MVP, m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33);
+
+    const __m256 m00v = _mm256_set1_ps(m00), m01v = _mm256_set1_ps(m01), m02v = _mm256_set1_ps(m02), m03v = _mm256_set1_ps(m03);
+    const __m256 m10v = _mm256_set1_ps(m10), m11v = _mm256_set1_ps(m11), m12v = _mm256_set1_ps(m12), m13v = _mm256_set1_ps(m13);
+    const __m256 m20v = _mm256_set1_ps(m20), m21v = _mm256_set1_ps(m21), m22v = _mm256_set1_ps(m22), m23v = _mm256_set1_ps(m23);
+    const __m256 m30v = _mm256_set1_ps(m30), m31v = _mm256_set1_ps(m31), m32v = _mm256_set1_ps(m32), m33v = _mm256_set1_ps(m33);
+
+    const float fw = (float)W, fh = (float)H;
+
+    for (size_t i = 0; i < N; ++i) {
+        // 标量部分：法线变换与属性拷贝
+        outTv[i].rgb = mesh->vertices[i].rgb;
+        outTv[i].normal = World * mesh->vertices[i].normal;
+        outTv[i].normal.normalise();
+
+        // SIMD 变换坐标（由于 N 通常很小，如 24，这里其实标量也不慢，但保留你的 AVX 实现）
+        const vec4& pIn = mesh->vertices[i].p;
+        float x = pIn[0], y = pIn[1], z = pIn[2], w = pIn[3];
+
+        float cx = x * m00 + y * m01 + z * m02 + w * m03;
+        float cy = x * m10 + y * m11 + z * m12 + w * m13;
+        float cz = x * m20 + y * m21 + z * m22 + w * m23;
+        float cw = x * m30 + y * m31 + z * m32 + w * m33;
+
+        float invW = 1.0f / cw;
+        outTv[i].p[0] = (cx * invW + 1.f) * 0.5f * fw;
+        outTv[i].p[1] = fh - (cy * invW + 1.f) * 0.5f * fh;
+        outTv[i].p[2] = cz * invW;
+    }
+}
+
+// 核心渲染函数：不再内部启动线程池，而是作为一个被并行的单元
+void renderObjectSync(Renderer& renderer, Mesh* mesh, const matrix& camera, Light& L, const matrix& world) {
+    matrix MVP = renderer.perspective * camera * world;
+
+    // 局部变量防止线程竞争
+    std::vector<Vertex> tv;
+    transformVerticesAVX(mesh, MVP, world, renderer.canvas.getWidth(), renderer.canvas.getHeight(), tv);
+
+    for (const auto& ind : mesh->triangles) {
+        const Vertex& v0 = tv[ind.v[0]];
+        const Vertex& v1 = tv[ind.v[1]];
+        const Vertex& v2 = tv[ind.v[2]];
+
+        // 1. Z-Clipping
+        if (std::abs(v0.p[2]) > 1.0f || std::abs(v1.p[2]) > 1.0f || std::abs(v2.p[2]) > 1.0f) continue;
+
+        // 2. Backface Culling (Screen Space)
+        float area2 = (v1.p[0] - v0.p[0]) * (v2.p[1] - v0.p[1]) - (v1.p[1] - v0.p[1]) * (v2.p[0] - v0.p[0]);
+        if (area2 <= 0.0f) continue;
+
+        triangle tri(v0, v1, v2);
+        // 注意：这里的 draw 内部必须是线程安全的（尤其是 Z-buffer 的写入）
+        tri.draw(renderer, L, mesh->ka, mesh->kd);
+    }
+}
+
 
 void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, ThreadPool* pool) {
 
@@ -51,20 +115,20 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
     getMatrixElems(P, m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33);
 
     const size_t N = mesh->vertices.size();
-	//static thread_local std::vector<Vertex> tv;
+    //static thread_local std::vector<Vertex> tv;
     std::vector<Vertex> tv;
     tv.resize(N);
 
     // SOA input
-    static thread_local std::vector<float> px, py, pz, pw;
+    std::vector<float> px, py, pz, pw;
     px.resize(N); py.resize(N); pz.resize(N); pw.resize(N);
 
     for (size_t i = 0; i < N; ++i) {
         const vec4& p = mesh->vertices[i].p;
-        px[i] = p[0]; 
-        py[i] = p[1]; 
+        px[i] = p[0];
+        py[i] = p[1];
         pz[i] = p[2];
-        pw[i] = p[3]; // 若你的 w 恒 1，可直接 pw[i]=1.f
+        pw[i] = p[3];
     }
 
     const float W = (float)renderer.canvas.getWidth();
@@ -91,9 +155,9 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
     }
 
     size_t i = 0;
-	// 
+    // 
     for (; i + 7 < N; i += 8) {
-		// Matrix-vector multiplication using AVX2
+        // Matrix-vector multiplication using AVX2
         __m256 x = _mm256_loadu_ps(&px[i]);
         __m256 y = _mm256_loadu_ps(&py[i]);
         __m256 z = _mm256_loadu_ps(&pz[i]);
@@ -116,11 +180,11 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
             _mm256_add_ps(_mm256_mul_ps(m30v, x), _mm256_mul_ps(m31v, y)),
             _mm256_add_ps(_mm256_mul_ps(m32v, z), _mm256_mul_ps(m33v, w)));
 
-		// Divide by W (perspective divide)
+        // Divide by W (perspective divide)
         // invW = 1/cw
         __m256 invW = _mm256_div_ps(one, cw);
 
-		// Map to NDC space
+        // Map to NDC space
         // ndc
         __m256 ndcX = _mm256_mul_ps(cx, invW);
         __m256 ndcY = _mm256_mul_ps(cy, invW);
@@ -223,16 +287,106 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
 
 }
 
+// 结构体用于缓存每个 Mesh 变换后的顶点数据，避免在 Tile 循环中重复计算
+struct TransformedMesh {
+    Mesh* originalMesh;
+    std::vector<Vertex> tv;
+    bool shouldRender = true;
+};
+
+void renderSceneMT(Renderer& renderer, const std::vector<Mesh*>& scene, matrix& camera, Light& L, ThreadPool& pool) {
+    const int W = (int)renderer.canvas.getWidth();
+    const int H = (int)renderer.canvas.getHeight();
+
+    // --- 阶段 1: 预处理所有 Mesh 的顶点 ---
+    std::vector<TransformedMesh> tScene(scene.size());
+    for (size_t mIdx = 0; mIdx < scene.size(); ++mIdx) {
+        Mesh* mesh = scene[mIdx];
+        tScene[mIdx].originalMesh = mesh;
+        tScene[mIdx].tv.resize(mesh->vertices.size());
+
+        const matrix P = renderer.perspective * camera * mesh->world;
+        const float fW = (float)W;
+        const float fH = (float)H;
+
+        // 这里可以使用你之前的 AVX2 代码进行顶点变换优化
+        // 为了简洁，此处展示核心逻辑：
+        for (size_t i = 0; i < mesh->vertices.size(); ++i) {
+            Vertex out = mesh->vertices[i];
+            out.p = P * mesh->vertices[i].p;
+            out.p.divideW();
+
+            out.normal = mesh->world * mesh->vertices[i].normal;
+            out.normal.normalise();
+
+            out.p[0] = (out.p[0] + 1.f) * 0.5f * fW;
+            out.p[1] = (out.p[1] + 1.f) * 0.5f * fH;
+            out.p[1] = fH - out.p[1];
+            tScene[mIdx].tv[i] = out;
+        }
+    }
+
+    // --- 阶段 2: 构建 Tile 任务批次 ---
+    const int tileW = mtTileW;
+    const int tileH = mtTileH;
+    const int tilesX = (W + tileW - 1) / tileW;
+    const int tilesY = (H + tileH - 1) / tileH;
+    const int totalTiles = tilesX * tilesY;
+
+    // 使用 parallel_for 一次性分发全场景任务
+    // 这里的 grain 设为 1 或 2，因为一个 Tile 的计算量已经足够大
+    pool.parallel_for(0, (size_t)totalTiles, [&](size_t tid) {
+        const int tx = (int)(tid % tilesX);
+        const int ty = (int)(tid / tilesX);
+
+        Scissor s{
+            tx * tileW,
+            ty * tileH,
+            std::min(W, tx * tileW + tileW),
+            std::min(H, ty * tileH + tileH)
+        };
+
+        // 在当前 Tile 中遍历场景内所有 Mesh
+        for (auto& tm : tScene) {
+            for (const triIndices& ind : tm.originalMesh->triangles) {
+                const Vertex& v0 = tm.tv[ind.v[0]];
+                const Vertex& v1 = tm.tv[ind.v[1]];
+                const Vertex& v2 = tm.tv[ind.v[2]];
+
+                // Z-Clip
+                if (std::abs(v0.p[2]) > 1.0f || std::abs(v1.p[2]) > 1.0f || std::abs(v2.p[2]) > 1.0f) continue;
+
+                // 背面剔除 (Backface Culling)
+                float area2 = (v1.p[0] - v0.p[0]) * (v2.p[1] - v0.p[1]) - (v1.p[1] - v0.p[1]) * (v2.p[0] - v0.p[0]);
+                if (area2 <= 0.0f) continue;
+
+                // 简单的 AABB 检查：如果三角形完全不在 Scissor 范围内，则不调用 draw
+                // 这能极大提升多线程效率
+                float minX = std::min({ v0.p[0], v1.p[0], v2.p[0] });
+                float maxX = std::max({ v0.p[0], v1.p[0], v2.p[0] });
+                float minY = std::min({ v0.p[1], v1.p[1], v2.p[1] });
+                float maxY = std::max({ v0.p[1], v1.p[1], v2.p[1] });
+
+                if (maxX < s.x0 || minX > s.x1 || maxY < s.y0 || minY > s.y1) continue;
+
+                triangle tri(v0, v1, v2);
+                tri.draw(renderer, L, tm.originalMesh->ka, tm.originalMesh->kd, &s);
+            }
+        }
+        }, 1);
+    // 注意：这里调用一次 waitIdle 是隐含在 parallel_for 结束处的
+}
+
 
 
 void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
- //   if (useSIMD) {
- //       renderOPT_AVX2(renderer, mesh, camera, L, pool);
- //       return;
-	//}
-    
-    // Combine perspective, camera, and world transformations for the mesh
+    //   if (useSIMD) {
+    //       renderOPT_AVX2(renderer, mesh, camera, L, pool);
+    //       return;
+       //}
+
+       // Combine perspective, camera, and world transformations for the mesh
     const matrix p = renderer.perspective * camera * mesh->world;
 
     // --- OPT1: Transform every vertex once per mesh (per frame) ---
@@ -264,7 +418,7 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
     }
 
     // --- Triangle loop: only gather 3 cached vertices and draw ---
-	//-----------use Backface Culling----------------
+    //-----------use Backface Culling----------------
     if (useBackfaceCulling) {
         for (triIndices& ind : mesh->triangles) {
             const Vertex& v0 = tv[ind.v[0]];
@@ -312,7 +466,7 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
     if (useRenderOPT) {
-        renderOPT(renderer, mesh, camera, L );
+        renderOPT(renderer, mesh, camera, L);
         return;
     }
 
@@ -331,7 +485,7 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
             // Transform normals into world space for accurate lighting
             // no need for perspective correction as no shearing or non-uniform scaling
-            t[i].normal = mesh->world * mesh->vertices[ind.v[i]].normal; 
+            t[i].normal = mesh->world * mesh->vertices[ind.v[i]].normal;
             t[i].normal.normalise();
 
             // Map normalized device coordinates to screen space
@@ -346,7 +500,7 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
         // Clip triangles with Z-values outside [-1, 1]
         if (fabs(t[0].p[2]) > 1.0f || fabs(t[1].p[2]) > 1.0f || fabs(t[2].p[2]) > 1.0f) continue;
 
-        if(useBackfaceCulling) {
+        if (useBackfaceCulling) {
             // -------- Back-face culling (screen-space signed area) --------
             if (useBackfaceCulling) {
                 const float x0 = t[0].p[0], y0 = t[0].p[1];
@@ -359,7 +513,7 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
                 if (area2 <= 0.0f) continue;
             }
             // ----------------------------------------------------------------
-		}
+        }
         // Create a triangle object and render it
         triangle tri(t[0], t[1], t[2]);
         tri.draw(renderer, L, mesh->ka, mesh->kd);
@@ -370,7 +524,7 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 // No input variables
 void sceneTest() {
     Renderer renderer;
-	ThreadPool pool;
+    ThreadPool pool;
     // create light source {direction, diffuse intensity, ambient intensity}
     Light L{ vec4(0.f, 1.f, 1.f, 0.f), colour(1.0f, 1.0f, 1.0f), colour(0.2f, 0.2f, 0.2f) };
     // camera is just a matrix
@@ -386,7 +540,7 @@ void sceneTest() {
 
     // add meshes to scene
     scene.push_back(&mesh);
-   // scene.push_back(&mesh2); 
+    // scene.push_back(&mesh2); 
 
     float x = 0.0f, y = 0.0f, z = -4.0f; // Initial translation parameters
     mesh.world = matrix::makeTranslation(x, y, z);
@@ -522,17 +676,19 @@ void scene1() {
             scene[1]->world = scene[1]->world
                 * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
 
-            for (auto& m : scene) {
-                if (useRenderOPT && useSIMD) {
-                    renderOPT_AVX2(renderer, m, camera, L, pool ? pool.get() : nullptr);
-                }
-                else if (useRenderOPT) {
-                    renderOPT(renderer, m, camera, L);
-                }
-                else {
-                    render(renderer, m, camera, L);
-                }
-            }
+            renderSceneMT(renderer, scene, camera, L, *pool);
+
+            //for (auto& m : scene) {
+            //    if (useRenderOPT && useSIMD) {
+            //        renderOPT_AVX2(renderer, m, camera, L, pool ? pool.get() : nullptr);
+            //    }
+            //    else if (useRenderOPT) {
+            //        renderOPT(renderer, m, camera, L);
+            //    }
+            //    else {
+            //        render(renderer, m, camera, L);
+            //    }
+            //}
 
         }
         else {
@@ -541,20 +697,21 @@ void scene1() {
                 * matrix::makeRotateXYZ(0.1f, 0.1f, 0.0f);
             worlds[1] = worlds[1]
                 * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
+            renderSceneMT(renderer, scene, camera, L, *pool);
 
-            for (const auto& W : worlds) {
-                cube.world = W;
+            //for (const auto& W : worlds) {
+            //    cube.world = W;
 
-                if (useRenderOPT && useSIMD) {
-                    renderOPT_AVX2(renderer, &cube, camera, L, pool ? pool.get() : nullptr);
-                }
-                else if (useRenderOPT) {
-                    renderOPT(renderer, &cube, camera, L);
-                }
-                else {
-                    render(renderer, &cube, camera, L);
-                }
-            }
+            //    if (useRenderOPT && useSIMD) {
+            //        renderOPT_AVX2(renderer, &cube, camera, L, pool ? pool.get() : nullptr);
+            //    }
+            //    else if (useRenderOPT) {
+            //        renderOPT(renderer, &cube, camera, L);
+            //    }
+            //    else {
+            //        render(renderer, &cube, camera, L);
+            //    }
+            //}
 
         }
 
@@ -578,7 +735,6 @@ void scene1() {
 void scene2() {
     FrameTimer timer;
     Renderer renderer;
-	ThreadPool pool;
     matrix camera = matrix::makeIdentity();
     Light L{ vec4(0.f, 1.f, 1.f, 0.f), colour(1.0f, 1.0f, 1.0f), colour(0.2f, 0.2f, 0.2f) };
 
@@ -588,6 +744,24 @@ void scene2() {
     std::vector<rRot> rotations;
 
     RandomNumberGenerator& rng = RandomNumberGenerator::getInstance();
+
+    const int W = (int)renderer.canvas.getWidth();
+    const int H = (int)renderer.canvas.getHeight();
+
+    const int tileW = mtTileW;
+    const int tileH = mtTileH;
+    const int tilesX = (W + tileW - 1) / tileW;
+    const int tilesY = (H + tileH - 1) / tileH;
+    const int tileCount = tilesX * tilesY;
+
+    size_t threads = mtThreadCount;
+    if (threads == 0) {
+        threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
+        if (threads == 0) threads = 1;
+    }
+
+    std::unique_ptr<ThreadPool> pool;
+    if (useMT && threads > 1) pool = std::make_unique<ThreadPool>(threads);
 
     // Create a grid of cubes with random rotations
     for (unsigned int y = 0; y < 6; y++) {
@@ -638,8 +812,10 @@ void scene2() {
 
         if (renderer.canvas.keyPressed(VK_ESCAPE)) break;
 
-        for (auto& m : scene)
-            render(renderer, m, camera, L);
+        renderSceneMT(renderer, scene, camera, L, *pool);
+
+        //for (auto& m : scene)
+        //    render(renderer, m, camera, L);
         renderer.present();
 
         timer.endFrame();
@@ -660,7 +836,7 @@ int main() {
     scene1();
     //scene2();
     //sceneTest(); 
-    
+
 
     return 0;
 }
