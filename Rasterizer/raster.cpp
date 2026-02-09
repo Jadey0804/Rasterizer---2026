@@ -1,13 +1,11 @@
 ﻿#include <iostream>
 #define _USE_MATH_DEFINES
 #include <cmath>
-
 #include "GamesEngineeringBase.h" // Include the GamesEngineeringBase header
 #include <algorithm>
 #include <vector>
 #include <chrono>
 
-#include <cmath>
 #include "matrix.h"
 #include "colour.h"
 #include "mesh.h"
@@ -20,7 +18,6 @@
 
 #include "BuildConfig.h"
 #include <immintrin.h>
-#include <vector>
 #include"ThreadPool.h"
 
 // Main rendering function that processes a mesh, transforms its vertices, applies lighting, and draws triangles on the canvas.
@@ -242,8 +239,8 @@ void renderOPT_AVX2(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L, Th
 
 
 
-    // 单线程 fallback（用于对比/或者关掉 MT）
-    if (!useMT || pool == nullptr || pool->size() <= 1) {
+    // 单线程 fallback（对比或关闭 MT）
+    if (!useSIMDMT || pool == nullptr || pool->size() <= 1) {
         for (const triIndices& ind : mesh->triangles) {
             const Vertex& v0 = tv[ind.v[0]];
             const Vertex& v1 = tv[ind.v[1]];
@@ -356,9 +353,10 @@ void renderSceneMT(Renderer& renderer, const std::vector<Mesh*>& scene, matrix& 
                 // Z-Clip
                 if (std::abs(v0.p[2]) > 1.0f || std::abs(v1.p[2]) > 1.0f || std::abs(v2.p[2]) > 1.0f) continue;
 
-                // 背面剔除 (Backface Culling)
-                float area2 = (v1.p[0] - v0.p[0]) * (v2.p[1] - v0.p[1]) - (v1.p[1] - v0.p[1]) * (v2.p[0] - v0.p[0]);
-                if (area2 <= 0.0f) continue;
+                if (useBackfaceCulling) {
+                    float area2 = (v1.p[0] - v0.p[0]) * (v2.p[1] - v0.p[1]) - (v1.p[1] - v0.p[1]) * (v2.p[0] - v0.p[0]);
+                    if (area2 <= 0.0f) continue;
+                }
 
                 // 简单的 AABB 检查：如果三角形完全不在 Scissor 范围内，则不调用 draw
                 // 这能极大提升多线程效率
@@ -381,12 +379,7 @@ void renderSceneMT(Renderer& renderer, const std::vector<Mesh*>& scene, matrix& 
 
 void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
 
-    //   if (useSIMD) {
-    //       renderOPT_AVX2(renderer, mesh, camera, L, pool);
-    //       return;
-       //}
-
-       // Combine perspective, camera, and world transformations for the mesh
+    // Combine perspective, camera, and world transformations for the mesh
     const matrix p = renderer.perspective * camera * mesh->world;
 
     // --- OPT1: Transform every vertex once per mesh (per frame) ---
@@ -425,19 +418,16 @@ void renderOPT(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
             const Vertex& v1 = tv[ind.v[1]];
             const Vertex& v2 = tv[ind.v[2]];
 
-            // 原本的 z check
             if (fabs(v0.p[2]) > 1.0f || fabs(v1.p[2]) > 1.0f || fabs(v2.p[2]) > 1.0f) continue;
 
             // -------- Back-face culling (screen-space) --------
-            if (useBackfaceCulling) {
-                float x0 = v0.p[0], y0 = v0.p[1];
-                float x1 = v1.p[0], y1 = v1.p[1];
-                float x2 = v2.p[0], y2 = v2.p[1];
+            float x0 = v0.p[0], y0 = v0.p[1];
+            float x1 = v1.p[0], y1 = v1.p[1];
+            float x2 = v2.p[0], y2 = v2.p[1];
 
-                float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+            float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
 
-                if (area2 <= 0.0f) continue;
-            }
+            if (area2 <= 0.0f) continue;
             // -----------------------------------------------
 
             triangle tri(v0, v1, v2);
@@ -473,7 +463,6 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
     // Combine perspective, camera, and world transformations for the mesh
     matrix p = renderer.perspective * camera * mesh->world;
 
-
     // Iterate through all triangles in the mesh
     for (triIndices& ind : mesh->triangles) {
         Vertex t[3]; // Temporary array to store transformed triangle vertices
@@ -501,18 +490,13 @@ void render(Renderer& renderer, Mesh* mesh, matrix& camera, Light& L) {
         if (fabs(t[0].p[2]) > 1.0f || fabs(t[1].p[2]) > 1.0f || fabs(t[2].p[2]) > 1.0f) continue;
 
         if (useBackfaceCulling) {
-            // -------- Back-face culling (screen-space signed area) --------
-            if (useBackfaceCulling) {
-                const float x0 = t[0].p[0], y0 = t[0].p[1];
-                const float x1 = t[1].p[0], y1 = t[1].p[1];
-                const float x2 = t[2].p[0], y2 = t[2].p[1];
+            const float x0 = t[0].p[0], y0 = t[0].p[1];
+            const float x1 = t[1].p[0], y1 = t[1].p[1];
+            const float x2 = t[2].p[0], y2 = t[2].p[1];
 
-                // area2 = cross((p1-p0),(p2-p0)) in 2D
-                const float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+            const float area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
 
-                if (area2 <= 0.0f) continue;
-            }
-            // ----------------------------------------------------------------
+            if (area2 <= 0.0f) continue;
         }
         // Create a triangle object and render it
         triangle tri(t[0], t[1], t[2]);
@@ -536,15 +520,11 @@ void sceneTest() {
 
     // Create a sphere and a rectangle mesh
     Mesh mesh = Mesh::makeSphere(1.0f, 10, 20);
-    //Mesh mesh2 = Mesh::makeRectangle(-2, -1, 2, 1);
-
     // add meshes to scene
     scene.push_back(&mesh);
-    // scene.push_back(&mesh2); 
 
     float x = 0.0f, y = 0.0f, z = -4.0f; // Initial translation parameters
     mesh.world = matrix::makeTranslation(x, y, z);
-    //mesh2.world = matrix::makeTranslation(x, y, z) * matrix::makeRotateX(0.01f);
 
     // Main rendering loop
     while (running) {
@@ -552,7 +532,6 @@ void sceneTest() {
         renderer.clear(); // Clear the canvas for the next frame
 
         // Apply transformations to the meshes
-     //   mesh2.world = matrix::makeTranslation(x, y, z) * matrix::makeRotateX(0.01f);
         mesh.world = matrix::makeTranslation(x, y, z);
 
         // Handle user inputs for transformations
@@ -596,24 +575,23 @@ void scene1() {
              colour(1.0f, 1.0f, 1.0f),
              colour(0.2f, 0.2f, 0.2f) };
 
-    const int W = (int)renderer.canvas.getWidth();
-    const int H = (int)renderer.canvas.getHeight();
-
-    const int tileW = mtTileW;
-    const int tileH = mtTileH;
-    const int tilesX = (W + tileW - 1) / tileW;
-    const int tilesY = (H + tileH - 1) / tileH;
-    const int tileCount = tilesX * tilesY;
-
-    size_t threads = mtThreadCount;
-    if (threads == 0) {
-        threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
-        if (threads == 0) threads = 1;
-    }
-
     std::unique_ptr<ThreadPool> pool;
-    if (useMT && threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    if (useSIMDMT) {
+        const int W = (int)renderer.canvas.getWidth();
+        const int H = (int)renderer.canvas.getHeight();
+        const int tileW = mtTileW;
+        const int tileH = mtTileH;
+        const int tilesX = (W + tileW - 1) / tileW;
+        const int tilesY = (H + tileH - 1) / tileH;
+        const int tileCount = tilesX * tilesY;
 
+        size_t threads = mtThreadCount;
+        if (threads == 0) {
+            threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
+            if (threads == 0) threads = 1;
+        }
+        if (threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    }
 
     float zoffset = 8.0f;
     float step = -0.1f;
@@ -676,20 +654,19 @@ void scene1() {
             scene[1]->world = scene[1]->world
                 * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
 
-            renderSceneMT(renderer, scene, camera, L, *pool);
-
-            //for (auto& m : scene) {
-            //    if (useRenderOPT && useSIMD) {
-            //        renderOPT_AVX2(renderer, m, camera, L, pool ? pool.get() : nullptr);
-            //    }
-            //    else if (useRenderOPT) {
-            //        renderOPT(renderer, m, camera, L);
-            //    }
-            //    else {
-            //        render(renderer, m, camera, L);
-            //    }
-            //}
-
+            if (useSIMDMT && pool) {
+                renderSceneMT(renderer, scene, camera, L, *pool);
+            }
+            else {
+                for (auto& m : scene) {
+                    if (useRenderOPT) {
+                        renderOPT(renderer, m, camera, L);
+                    }
+                    else {
+                        render(renderer, m, camera, L);
+                    }
+                }
+            }
         }
         else {
             // -------- optimized render --------
@@ -697,22 +674,16 @@ void scene1() {
                 * matrix::makeRotateXYZ(0.1f, 0.1f, 0.0f);
             worlds[1] = worlds[1]
                 * matrix::makeRotateXYZ(0.0f, 0.1f, 0.2f);
-            renderSceneMT(renderer, scene, camera, L, *pool);
 
-            //for (const auto& W : worlds) {
-            //    cube.world = W;
-
-            //    if (useRenderOPT && useSIMD) {
-            //        renderOPT_AVX2(renderer, &cube, camera, L, pool ? pool.get() : nullptr);
-            //    }
-            //    else if (useRenderOPT) {
-            //        renderOPT(renderer, &cube, camera, L);
-            //    }
-            //    else {
-            //        render(renderer, &cube, camera, L);
-            //    }
-            //}
-
+            for (const auto& W : worlds) {
+                cube.world = W;
+                if (useRenderOPT) {
+                    renderOPT(renderer, &cube, camera, L);
+                }
+                else {
+                    render(renderer, &cube, camera, L);
+                }
+            }
         }
 
         renderer.present();
@@ -730,6 +701,7 @@ void scene1() {
 }
 
 
+
 // Scene with a grid of cubes and a moving sphere
 // No input variables
 void scene2() {
@@ -744,24 +716,23 @@ void scene2() {
     std::vector<rRot> rotations;
 
     RandomNumberGenerator& rng = RandomNumberGenerator::getInstance();
-
-    const int W = (int)renderer.canvas.getWidth();
-    const int H = (int)renderer.canvas.getHeight();
-
-    const int tileW = mtTileW;
-    const int tileH = mtTileH;
-    const int tilesX = (W + tileW - 1) / tileW;
-    const int tilesY = (H + tileH - 1) / tileH;
-    const int tileCount = tilesX * tilesY;
-
-    size_t threads = mtThreadCount;
-    if (threads == 0) {
-        threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
-        if (threads == 0) threads = 1;
-    }
-
     std::unique_ptr<ThreadPool> pool;
-    if (useMT && threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    if (useSIMDMT) {
+        const int W = (int)renderer.canvas.getWidth();
+        const int H = (int)renderer.canvas.getHeight();
+        const int tileW = mtTileW;
+        const int tileH = mtTileH;
+        const int tilesX = (W + tileW - 1) / tileW;
+        const int tilesY = (H + tileH - 1) / tileH;
+        const int tileCount = tilesX * tilesY;
+
+        size_t threads = mtThreadCount;
+        if (threads == 0) {
+            threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
+            if (threads == 0) threads = 1;
+        }
+        if (threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    }
 
     // Create a grid of cubes with random rotations
     for (unsigned int y = 0; y < 6; y++) {
@@ -783,9 +754,6 @@ void scene2() {
     float sphereStep = 0.1f;
     sphere->world = matrix::makeTranslation(sphereOffset, 0.f, -6.f);
 
-    auto start = std::chrono::high_resolution_clock::now();
-    std::chrono::time_point<std::chrono::high_resolution_clock> end;
-    int cycle = 0;
 
     bool running = true;
 
@@ -803,19 +771,23 @@ void scene2() {
         sphere->world = matrix::makeTranslation(sphereOffset, 0.f, -6.f);
         if (sphereOffset > 6.0f || sphereOffset < -6.0f) {
             sphereStep *= -1.f;
-            if (++cycle % 2 == 0) {
-                //end = std::chrono::high_resolution_clock::now();
-                //std::cout << cycle / 2 << " :" << std::chrono::duration<double, std::milli>(end - start).count() << "ms\n";
-                //start = std::chrono::high_resolution_clock::now();
-            }
         }
 
         if (renderer.canvas.keyPressed(VK_ESCAPE)) break;
 
-        renderSceneMT(renderer, scene, camera, L, *pool);
-
-        //for (auto& m : scene)
-        //    render(renderer, m, camera, L);
+        if (useSIMDMT && pool) {
+            renderSceneMT(renderer, scene, camera, L, *pool);
+        }
+        else {
+            for (auto& m : scene) {
+                if (useRenderOPT) {
+                    renderOPT(renderer, m, camera, L);
+                }
+                else {
+                    render(renderer, m, camera, L);
+                }
+            }
+        }
         renderer.present();
 
         timer.endFrame();
@@ -836,7 +808,5 @@ int main() {
     scene1();
     //scene2();
     //sceneTest(); 
-
-
     return 0;
 }
