@@ -565,6 +565,44 @@ matrix makeRandomRotation() {
     }
 }
 
+struct Scene3Object {
+    Mesh* mesh = nullptr;
+    matrix world = matrix::makeIdentity();
+    vec4 center = vec4(0.f, 0.f, 0.f, 1.f);
+    float radius = 1.0f;
+    vec4 rotSpeed = vec4(0.f, 0.f, 0.f, 0.f);
+};
+
+static float computeMeshRadius(const Mesh& mesh) {
+    float maxLen2 = 0.0f;
+    for (const auto& v : mesh.vertices) {
+        const float x = v.p[0];
+        const float y = v.p[1];
+        const float z = v.p[2];
+        const float len2 = x * x + y * y + z * z;
+        if (len2 > maxLen2) maxLen2 = len2;
+    }
+    return std::sqrt(maxLen2);
+}
+
+static bool isVisibleApprox(const matrix& viewProj, const vec4& center, float radius) {
+    const vec4 clip = viewProj * center;
+    if (clip[3] <= 0.0f) return false;
+    const float invW = 1.0f / clip[3];
+    const float ndcX = clip[0] * invW;
+    const float ndcY = clip[1] * invW;
+    const float ndcZ = clip[2] * invW;
+    const float expand = 0.2f + radius * 0.02f;
+    if (ndcX < -1.0f - expand || ndcX > 1.0f + expand) return false;
+    if (ndcY < -1.0f - expand || ndcY > 1.0f + expand) return false;
+    if (ndcZ < -1.0f - expand || ndcZ > 1.0f + expand) return false;
+    return true;
+}
+
+
+
+//=============================================  scene1   ===========================================================
+
 // Function to render a scene with multiple objects and dynamic transformations
 // No input variables
 void scene1() {
@@ -701,7 +739,7 @@ void scene1() {
 }
 
 
-
+//=============================================  scene2   ===========================================================
 // Scene with a grid of cubes and a moving sphere
 // No input variables
 void scene2() {
@@ -801,12 +839,148 @@ void scene2() {
 
 }
 
+//=============================================  scene3   ===========================================================
+// Scene3: heavier scene to stress rasterization, SIMD, and multithreading.
+void scene3() {
+    FrameTimer timer;
+    Renderer renderer;
+    matrix camera = matrix::makeIdentity();
+    Light L{ vec4(0.f, 1.f, 1.f, 0.f),
+             colour(1.0f, 1.0f, 1.0f),
+             colour(0.2f, 0.2f, 0.2f) };
+
+    std::unique_ptr<ThreadPool> pool;
+    if (useSIMDMT) {
+        const int W = (int)renderer.canvas.getWidth();
+        const int H = (int)renderer.canvas.getHeight();
+        const int tilesX = (W + mtTileW - 1) / mtTileW;
+        const int tilesY = (H + mtTileH - 1) / mtTileH;
+        const int tileCount = tilesX * tilesY;
+
+        size_t threads = mtThreadCount;
+        if (threads == 0) {
+            threads = std::min((size_t)std::thread::hardware_concurrency(), (size_t)tileCount);
+            if (threads == 0) threads = 1;
+        }
+        if (threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    }
+
+    std::vector<Scene3Object> objects;
+    objects.reserve(600);
+
+    Mesh hiSphere = Mesh::makeSphere(1.0f, 24, 48);
+    Mesh medSphere = Mesh::makeSphere(0.6f, 16, 32);
+    Mesh cube = Mesh::makeCube(0.9f);
+
+    const float rHi = computeMeshRadius(hiSphere);
+    const float rMed = computeMeshRadius(medSphere);
+    const float rCube = computeMeshRadius(cube);
+
+    RandomNumberGenerator& rng = RandomNumberGenerator::getInstance();
+
+    // Dense cube grid (many small triangles; good for SIMD edge rasterization).
+    for (int y = 0; y < 12; ++y) {
+        for (int x = 0; x < 18; ++x) {
+            Mesh* m = new Mesh();
+            *m = cube;
+            Scene3Object obj;
+            obj.mesh = m;
+            obj.radius = rCube;
+            obj.rotSpeed = vec4(rng.getRandomFloat(-0.03f, 0.03f),
+                rng.getRandomFloat(-0.03f, 0.03f),
+                rng.getRandomFloat(-0.03f, 0.03f), 0.f);
+            const float px = -16.0f + x * 2.0f;
+            const float py = 8.0f - y * 1.6f;
+            const float pz = -18.0f;
+            obj.world = matrix::makeTranslation(px, py, pz);
+            objects.push_back(obj);
+        }
+    }
+
+    // Sphere belt to add high triangle density.
+    for (int i = 0; i < 160; ++i) {
+        Mesh* m = new Mesh();
+        *m = (i % 2 == 0) ? hiSphere : medSphere;
+        Scene3Object obj;
+        obj.mesh = m;
+        obj.radius = (i % 2 == 0) ? rHi : rMed;
+        obj.rotSpeed = vec4(rng.getRandomFloat(-0.02f, 0.02f),
+            rng.getRandomFloat(-0.02f, 0.02f),
+            rng.getRandomFloat(-0.02f, 0.02f), 0.f);
+        const float angle = (float)i / 160.0f * 2.0f * (float)M_PI;
+        const float ringR = 12.0f + rng.getRandomFloat(-1.5f, 1.5f);
+        const float px = std::cos(angle) * ringR;
+        const float py = rng.getRandomFloat(-3.0f, 3.0f);
+        const float pz = -26.0f + std::sin(angle) * 2.0f;
+        obj.world = matrix::makeTranslation(px, py, pz);
+        objects.push_back(obj);
+    }
+
+    float cameraZ = 0.0f;
+    float cameraStep = -0.08f;
+
+    while (!timer.finished()) {
+        timer.beginFrame();
+        renderer.canvas.checkInput();
+        renderer.clear();
+
+        if (renderer.canvas.keyPressed(VK_ESCAPE)) break;
+
+        cameraZ += cameraStep;
+        if (cameraZ < -10.0f || cameraZ > 2.0f) cameraStep *= -1.f;
+        camera = matrix::makeTranslation(0.f, 0.f, cameraZ);
+
+        const matrix viewProj = renderer.perspective * camera;
+
+        std::vector<Mesh*> visible;
+        visible.reserve(objects.size());
+
+        for (auto& obj : objects) {
+            obj.world = obj.world * matrix::makeRotateXYZ(obj.rotSpeed[0], obj.rotSpeed[1], obj.rotSpeed[2]);
+            obj.mesh->world = obj.world;
+
+            if (useScene3FrustumCull) {
+                const vec4 centerWS = obj.world * obj.center;
+                if (!isVisibleApprox(viewProj, centerWS, obj.radius)) continue;
+            }
+
+            visible.push_back(obj.mesh);
+        }
+
+        if (useSIMDMT && pool) {
+            renderSceneMT(renderer, visible, camera, L, *pool);
+        }
+        else {
+            for (auto& m : visible) {
+                if (useRenderOPT) {
+                    renderOPT(renderer, m, camera, L);
+                }
+                else {
+                    render(renderer, m, camera, L);
+                }
+            }
+        }
+
+        renderer.present();
+        timer.endFrame();
+    }
+
+    for (auto& obj : objects) {
+        delete obj.mesh;
+    }
+
+    std::cout << "[SCENE3]"
+        << " FPS: " << timer.averageFPS()
+        << " ; " << timer.averageFrameTimeMs() << " ms\n";
+}
+
 // Entry point of the application
 // No input variables
 int main() {
     // Uncomment the desired scene function to run
-    scene1();
-    //scene2();
-    //sceneTest(); 
+    //scene1();
+    scene2();
+    //sceneTest();
+    scene3();
     return 0;
 }
